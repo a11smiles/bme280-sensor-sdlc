@@ -1,0 +1,206 @@
+# .github/workflows/sensor-fault-to-copilot.yml
+#
+# When a field device files an issue labeled `sensor-fault`, hand it to the
+# Copilot cloud agent with root-cause instructions. Copilot opens a draft PR
+# that links back to the issue ("Fixes #N").
+#
+# Required repository secret:
+#   COPILOT_ASSIGN_TOKEN  - user token (fine-grained PAT) belonging to a user with
+#                           a Copilot license. Permissions on this repo:
+#                             Metadata: read
+#                             Actions, Contents, Issues, Pull requests: read & write
+#                           (GITHUB_TOKEN / GitHub App installation tokens cannot
+#                            assign Copilot - assignment requires a user token.)
+#
+# Optional repository variable:
+#   COPILOT_MODEL         - model for the agent session; empty = auto selection
+
+name: "Sensor fault → Copilot"
+
+on:
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  contents: read
+  issues: write
+
+# Issues created with labels fire both `opened` and `labeled`; serialize per
+# issue so the second run sees the first run's assignment and skips.
+concurrency:
+  group: sensor-fault-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+env:
+  TRIGGER_LABEL: sensor-fault
+  IN_PROGRESS_LABEL: copilot-fixing
+
+jobs:
+  dispatch-to-copilot:
+    name: Dispatch fault to Copilot cloud agent
+    if: >-
+      github.event.issue.pull_request == null &&
+      github.event.issue.state == 'open' &&
+      contains(github.event.issue.labels.*.name, 'sensor-fault') &&
+      (github.event.action == 'opened' || github.event.label.name == 'sensor-fault')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      ISSUE: ${{ github.event.issue.number }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: Check prerequisites
+        env:
+          COPILOT_TOKEN: ${{ secrets.COPILOT_ASSIGN_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COPILOT_TOKEN}" ]; then
+            echo "::error::Repository secret COPILOT_ASSIGN_TOKEN is not set."
+            exit 1
+          fi
+
+      - name: Skip if Copilot is already assigned
+        id: guard
+        run: |
+          set -euo pipefail
+          assignees=$(gh api "repos/$REPO/issues/$ISSUE" --jq '[.assignees[].login] | join(",")')
+          echo "Current assignees: ${assignees:-<none>}"
+          if echo ",${assignees}," | grep -qi 'copilot'; then
+            echo "Copilot already assigned to #$ISSUE — nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract fault details from the issue
+        if: steps.guard.outputs.skip == 'false'
+        id: details
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          fingerprint=$(printf '%s' "$ISSUE_BODY" | grep -oE 'fingerprint=[0-9a-f]+' | head -1 | cut -d= -f2 || true)
+          echo "fingerprint=${fingerprint:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "Fingerprint: ${fingerprint:-unknown}"
+
+      - name: Acknowledge on the issue
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          FINGERPRINT: ${{ steps.details.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          gh issue comment "$ISSUE" --repo "$REPO" --body "$(cat <<EOF
+          ### 🤖 Automated triage
+          Device fault \`${FINGERPRINT}\` received. Dispatching to **Copilot cloud agent** for root-cause analysis and a fix.
+
+          - Copilot will open a **draft pull request** against \`${DEFAULT_BRANCH}\` linked to this issue.
+          - CI, code scanning, and human review gate the merge.
+
+          _Workflow run: ${RUN_URL}_
+          EOF
+          )"
+
+      - name: Assign Copilot with fix instructions
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_ASSIGN_TOKEN }}
+          COPILOT_MODEL: ${{ vars.COPILOT_MODEL }}
+        run: |
+          set -euo pipefail
+
+          read -r -d '' INSTRUCTIONS <<'EOF' || true
+          This issue was filed automatically by sensor_monitor.py running on a Raspberry Pi
+          with a Bosch BME280 sensor. The issue body contains the full stack trace, the
+          reading that triggered the fault, a "Telemetry frame field analysis" table,
+          the source context at the deployed commit, and local variables per stack frame.
+
+          Your task:
+          1. Use the stack trace and the field-analysis table to identify the ROOT CAUSE.
+             Do not wrap the failing call in try/except, clamp the value, or drop the sample
+             to make the error disappear - the reading is physically valid and must be
+             transmitted correctly.
+          2. Fix the defect so that every value across the sensor's full rated range
+             (-40..85 C, 0..100 %RH, 300..1100 hPa) encodes without error and round-trips
+             through decode_frame within one least-significant bit.
+          3. Keep encode_frame, decode_frame, FIELD_SCALES, FRAME_STRUCT, and the wire-format
+             comment block consistent with each other. If the on-wire format changes,
+             increment FRAME_VERSION.
+          4. Add pytest regression tests in tests/test_telemetry_frame.py covering: the exact
+             failing reading from this issue, the boundaries of every rated range, values just
+             above and below any previous representable limit, and encode/decode round-trips.
+             The tests must not require sensor hardware or network access.
+          5. Do not modify the GitHub issue-reporting code or the diagnostics collection.
+          6. In the PR description, explain the root cause in two or three sentences,
+             note any wire-format compatibility impact for receivers, and include "Fixes #__ISSUE__".
+          EOF
+          INSTRUCTIONS="${INSTRUCTIONS//__ISSUE__/$ISSUE}"
+
+          payload=$(jq -n \
+            --arg repo "$REPO" \
+            --arg base "$DEFAULT_BRANCH" \
+            --arg instr "$INSTRUCTIONS" \
+            --arg model "${COPILOT_MODEL:-}" \
+            '{
+              assignees: ["copilot-swe-agent[bot]"],
+              agent_assignment: {
+                target_repo: $repo,
+                base_branch: $base,
+                custom_instructions: $instr,
+                custom_agent: "",
+                model: $model
+              }
+            }')
+
+          response=$(gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/$REPO/issues/$ISSUE/assignees" \
+            --input - <<< "$payload")
+
+          echo "$response" | jq '{number, title, assignees: [.assignees[].login]}'
+
+          if ! echo "$response" | jq -e '[.assignees[].login | ascii_downcase] | any(test("copilot"))' > /dev/null; then
+            echo "::error::Assignment call succeeded but Copilot is not in the assignee list. Check that Copilot cloud agent is enabled for this repository and that the token owner has a Copilot license."
+            exit 1
+          fi
+
+      - name: Label as in progress
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          gh label create "$IN_PROGRESS_LABEL" --repo "$REPO" --color "1d76db" \
+            --description "Copilot cloud agent is working on this" --force
+          gh issue edit "$ISSUE" --repo "$REPO" --add-label "$IN_PROGRESS_LABEL"
+
+      - name: Job summary
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          TITLE: ${{ github.event.issue.title }}
+          FINGERPRINT: ${{ steps.details.outputs.fingerprint }}
+        run: |
+          {
+            echo "## Sensor fault dispatched to Copilot"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Issue | #${ISSUE} — ${TITLE//|/\\|} |"
+            echo "| Fingerprint | \`${FINGERPRINT}\` |"
+            echo "| Base branch | \`${DEFAULT_BRANCH}\` |"
+            echo "| Agent | Copilot cloud agent |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report failure on the issue
+        if: failure()
+        run: |
+          gh issue comment "$ISSUE" --repo "$REPO" --body "### ⚠️ Could not dispatch to Copilot
+          The automation failed to assign Copilot to this issue. See the [workflow run](${RUN_URL}) for details.
+
+          Common causes: \`COPILOT_ASSIGN_TOKEN\` missing/expired, token owner lacks a Copilot license, or Copilot cloud agent is disabled for this repository. You can assign Copilot manually from the Assignees menu." || true

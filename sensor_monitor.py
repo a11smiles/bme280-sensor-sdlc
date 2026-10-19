@@ -103,25 +103,26 @@ SENSOR_RATED_RANGES = {
 #
 # Little-endian, fixed size. Sent over a bandwidth-constrained link, so values
 # are transmitted as scaled integers rather than floats.
+# Version 2 widens humidity to uint32; receivers must use the new 16-byte frame.
 #
 #   B  magic           0xB2
 #   B  version         frame format version
 #   I  sequence        monotonically increasing sample counter
 #   h  temperature     centi-degC     (23.47 C    -> 2347)
-#   H  humidity        milli-%RH      (45.123 %   -> 45123)
+#   I  humidity        milli-%RH      (45.123 %   -> 45123)
 #   H  pressure        deci-hPa       (1013.2 hPa -> 10132)
 #   H  crc16           CRC-16/CCITT-FALSE over all preceding bytes
 
 FRAME_MAGIC = 0xB2
-FRAME_VERSION = 1
+FRAME_VERSION = 2
 FRAME_FIELDS = ("magic", "version", "sequence", "temperature_c", "humidity_pct", "pressure_hpa")
-FRAME_STRUCT = struct.Struct("<BBIhHH")
+FRAME_STRUCT = struct.Struct("<BBIhIH")
 CRC_STRUCT = struct.Struct("<H")
 
 # Fixed-point scale factor for each measurement on the wire.
 FIELD_SCALES = {
     "temperature_c": 100,    # centi-degC
-    "humidity_pct": 1000,    # milli-%RH: humidity is 0-100 %, so this always fits a uint16
+    "humidity_pct": 1000,    # milli-%RH: 0-100 % requires 0-100000 (uint32)
     "pressure_hpa": 10,      # deci-hPa
 }
 
